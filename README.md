@@ -1,4 +1,4 @@
-## Connections for Wemos Lolin32 lite 
+## Connections for DOIT ESP32 DEV KIT v1
 
 | GPIO | TFT   | Description         |
 | ---: | :---- | :------------------ |
