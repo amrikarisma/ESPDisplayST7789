@@ -11,6 +11,7 @@
 #include "NotoSansBold36.h"
 #include "main.h"
 #include "splash.h"
+
 #define AA_FONT_SMALL NotoSansBold15
 #define AA_FONT_LARGE NotoSansBold36
 #include "NotoSans_Bold6pt7b.h"
@@ -18,7 +19,14 @@
 #define AA_FONT_FREE_SMALL &NotoSans_Bold6pt7b
 #define AA_FONT_FREE_MEDIUM &NotoSans_Bold16pt7b
 
-const char *version = "0.1";
+const char *version = "0.1.1";
+
+const char *ssid = "MAZDUINO_Display";
+const char *password = "12345678";
+IPAddress ip(192, 168, 1, 80);
+IPAddress netmask(255, 255, 255, 0);
+
+WebServer server(80);
 
 TFT_eSPI display = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&display);
@@ -26,6 +34,7 @@ TFT_eSprite spr = TFT_eSprite(&display);
 #include "Comms.h"
 #include "text_utils.h"
 #include "drawing_utils.h"
+#include <esp32_can.h>
 
 #define UART_BAUD 115200
 
@@ -37,11 +46,17 @@ TFT_eSprite spr = TFT_eSprite(&display);
 #define TXD 17
 #endif
 
+#define COMM_CAN 0
+#define COMM_SERIAL 1
+
 #define EEPROM_SIZE 512
 
 bool isColorFull = false;
+
 bool forceRefresh = false;
 bool dataReceived = false;
+int commMode = COMM_CAN;
+
 uint8_t iat = 20, clt = 30;
 uint8_t refreshRate = 0;
 unsigned int rpm = 0, lastRpm = 1, vss = 0;
@@ -94,20 +109,75 @@ void setup()
 	EEPROM.begin(EEPROM_SIZE);
 
 	isColorFull = EEPROM.read(0);
+	commMode = EEPROM.read(1);
+	if (commMode == COMM_CAN)
+	{
 
+		CAN0.setCANPins(GPIO_NUM_17, GPIO_NUM_16); // RX, TX
+		CAN0.begin(500000);						   // 500Kbps
+		CAN0.watchFor(0x360);					   // RPM, MAP, TPS
+		// CAN0.watchFor(0x361); // Fuel Pressure
+		CAN0.watchFor(0x368); // AFR 01
+		// CAN0.watchFor(0x370); // VSS
+		CAN0.watchFor(0x372); // Voltage
+		CAN0.watchFor(0x3E0); // CLT, IAT
+		Serial.println("CAN mode aktif.");
+	}
+	else
+	{
+		Serial1.begin(UART_BAUD, SERIAL_8N1, RXD, TXD);
+		Serial.println("Serial mode aktif.");
+	}
 	display.init();
 	display.setRotation(1);
 	drawSplashScreenWithImage();
 	display.fillScreen(TFT_BLACK);
-	Serial1.begin(UART_BAUD, SERIAL_8N1, RXD, TXD);
-	Serial.println("Serial mode aktif.");
+  WiFi.mode(WIFI_MODE_AP);
+  WiFi.softAPConfig(ip, ip, netmask);
+  WiFi.softAP(ssid, password);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on(
+      "/update", HTTP_POST, []()
+      {
+      server.send(200, "text/plain", (Update.hasError()) ? "Gagal update!" : "Update berhasil! MAZDUINO Display akan restart.");
+      delay(1000);
+      ESP.restart(); },
+      handleUpdate);
+  server.on("/toggle", HTTP_POST, handleToggle); // Endpoint untuk toggle
+  server.on("/setMode", HTTP_POST, []()
+            {
+              String mode = server.arg("mode");
+              if (mode == "serial")
+              {
+                commMode = COMM_SERIAL;
+              }
+              else if (mode == "can")
+              {
+                commMode = COMM_CAN;
+              }
+              EEPROM.write(1, commMode);
+              EEPROM.commit();
+              server.send(200, "text/plain", "Mode updated");
+              ESP.restart(); // Restart untuk menerapkan perubahan
+            });
+  server.begin();
+  Serial.println("Web server aktif.");
+
 }
 
 void loop()
 {
 	isColorFull = EEPROM.read(0);
 
-	handleSerialCommunication();
+	if (commMode == COMM_CAN)
+	{
+		handleCANCommunication();
+	}
+	else
+	{
+		handleSerialCommunication();
+	}
 
 	// runDemo();
 	drawData();
@@ -145,6 +215,112 @@ void drawSplashScreenWithImage()
 	display.drawString("Powered by " + String(ESP.getChipModel()) + " Rev" + String(ESP.getChipRevision()), centerX, 170 - 15);
 
 	delay(1000);
+}
+
+void handleCANCommunication()
+{
+	static uint32_t lastRefresh = millis();
+	uint32_t elapsed = millis() - lastRefresh;
+	refreshRate = (elapsed > 0) ? (1000 / elapsed) : 0;
+	lastRefresh = millis();
+	unsigned long currentTime = millis();
+	if (CAN0.available())
+	{ // Periksa apakah ada pesan di buffer
+		CAN_FRAME can_message;
+		if (CAN0.read(can_message))
+		{
+			// Serial.print("ID: ");
+			// Serial.print(can_message.id, HEX);
+			// Serial.print(" Data: ");
+			// for (int i = 0; i < can_message.length; i++)
+			// {
+			//   Serial.print(can_message.data.byte[i], HEX);
+			//   Serial.print(" ");
+			// }
+			// Serial.println();
+
+			// Proses data berdasarkan ID
+			switch (can_message.id)
+			{
+			case 0x360:
+			{																				   // RPM, MAP, TPS
+				rpm = (can_message.data.byte[0] << 8) | can_message.data.byte[1];			   // Byte 0-1
+				uint16_t map = (can_message.data.byte[2] << 8) | can_message.data.byte[3];	   // Byte 2-3
+				uint16_t tps_raw = (can_message.data.byte[4] << 8) | can_message.data.byte[5]; // Byte 4-5
+				mapData = map / 10.0;														   // Konversi ke kPa
+				tps = tps_raw / 10.0;														   // Konversi ke kPa
+				break;
+			}
+			case 0x361:
+			{																						 // Fuel Pressure
+				uint16_t fuel_pressure = (can_message.data.byte[0] << 8) | can_message.data.byte[1]; // Byte 0-1
+				fp = fuel_pressure / 10 - 101.3;
+				break;
+			}
+			case 0x368:
+			{																				   // AFR 01
+				uint16_t afr_raw = (can_message.data.byte[0] << 8) | can_message.data.byte[1]; // Byte 0-1
+				float lambda = afr_raw / 1000.0;
+				afr = lambda * 14.7;
+				break;
+			}
+			case 0x370:
+			{																				   // VSS
+				uint16_t vss_raw = (can_message.data.byte[0] << 8) | can_message.data.byte[1]; // Byte 0-1
+				vss = vss_raw / 10.0;														   // Konversi ke km/h
+				break;
+			}
+			case 0x372:
+			{																				   // Voltage
+				uint16_t voltage = (can_message.data.byte[0] << 8) | can_message.data.byte[1]; // Byte 0-1
+				bat = voltage / 10.0;														   // Konversi ke volt
+				break;
+			}
+			case 0x3E0:
+			{																				   // CLT
+				uint16_t clt_raw = (can_message.data.byte[0] << 8) | can_message.data.byte[1]; // Byte 0-1
+				uint16_t iat_raw = (can_message.data.byte[2] << 8) | can_message.data.byte[3]; // Byte 0-1
+				float clt_k = clt_raw / 10.0;
+				float iat_k = iat_raw / 10.0;
+
+				clt = clt_k - 273.15;
+				iat = iat_k - 273.15;
+				break;
+			}
+			default:
+				break;
+			}
+		}
+		else
+		{
+			Serial.println("Error reading CAN message.");
+		}
+	}
+
+	if (currentTime - lastPrintTime >= 1000)
+	{ // Interval 1000ms
+		Serial.print("RPM: ");
+		Serial.print(rpm);
+		Serial.print(" MAP: ");
+		Serial.print(mapData);
+		Serial.print(" kPa TPS: ");
+		Serial.print(tps);
+		Serial.print(" % Fuel Pressure: ");
+		Serial.print(fp);
+		Serial.print(" kPa AFR: ");
+		Serial.print(afr, 2);
+		Serial.print(" VSS: ");
+		Serial.print(vss);
+		Serial.print(" km/h Voltage: ");
+		Serial.print(bat, 2);
+		Serial.print(" V CLT: ");
+		Serial.print(clt);
+		Serial.print(" °C IAT: ");
+		Serial.print(iat);
+		Serial.println(" °C");
+
+		lastPrintTime = currentTime;
+	}
 }
 
 void handleSerialCommunication()
@@ -466,4 +642,126 @@ void itemDraw(bool setup)
 	itemDrawDataInt(tps, lastTps, 150, 90, "TPS");
 	itemDrawDataInt(mapData, lastMapData, 205, 90, "MAP");
 	itemDrawDataInt(adv, lastAdv, 265, 90, "ADV");
+}
+
+
+const char *uploadPage PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>MAZDUINO Display OTA Update</title>
+    <style>
+      body {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        flex-direction: column;
+        height: 100vh;
+        background-color: black;
+        color: white;
+      }
+      .btn {
+        padding: 10px 20px;
+        font-size: 16px;
+        background-color: #007BFF;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+      }
+      .toggle-btn.off {
+        background-color: #FF0000;
+      }
+    </style>
+    <script>
+      function toggleState(button) {
+        if (button.classList.contains('off')) {
+          button.classList.remove('off');
+          button.textContent = "Display 2";
+          // Kirim status ON ke server
+          fetch('/toggle', { method: 'POST', body: 'on' });
+        } else {
+          button.classList.add('off');
+          button.textContent = "Display 1";
+          // Kirim status OFF ke server
+          fetch('/toggle', { method: 'POST', body: 'off' });
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <h1>MAZDUINO Display OTA Update</h1>
+    <form method="POST" action="/update" enctype="multipart/form-data">
+      <input type="file" name="firmware">
+      <input type="submit" class="btn" value="Upload">
+    </form>
+    <hr>
+    <h2>Display Control</h2>
+    <p>Sabar ya nanti diupdate :) </p>
+    <!-- <button class="btn toggle-btn" onclick="toggleState(this)">Display 1</button> -->
+
+  </body>
+</html>
+)rawliteral";
+
+void handleRoot()
+{
+  server.send(200, "text/html", uploadPage);
+}
+
+void handleUpdate()
+{
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START)
+  {
+    Serial.printf("Memulai update: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+    {
+      Update.printError(Serial);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE)
+  {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+    {
+      Update.printError(Serial);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END)
+  {
+    if (Update.end(true))
+    {
+      // Serial.printf("Update selesai: %u bytes\n", upload.totalSize);
+    }
+    else
+    {
+      Update.printError(Serial);
+    }
+  }
+}
+
+void handleToggle()
+{
+  if (server.method() == HTTP_POST)
+  {
+    bool toggleState = EEPROM.read(0) || false;
+    String body = server.arg("plain"); // Ambil isi body POST
+    if (body == "on")
+    {
+      toggleState = 1;
+      Serial.println("Toggle: ON");
+    }
+    else if (body == "off")
+    {
+      toggleState = 0;
+      Serial.println("Toggle: OFF");
+    }
+    EEPROM.write(0, toggleState);
+    EEPROM.commit();
+
+    server.send(200, "text/plain", "OK");
+    delay(1000);
+    ESP.restart();
+  }
 }
