@@ -1,4 +1,4 @@
-# ESP32 Display ST7789 for Speeduino
+# ESP32 Display ST7789 for Speeduino & rusEFI (Haltech Canbus)
 
 ESP32-based display system for Speeduino ECU with ST7789 TFT display (320x170). Supports both CAN bus and Serial communication protocols.
 
