@@ -115,7 +115,7 @@ pio device monitor -p /dev/cu.wchusbserial1120
 ## Configuration
 
 ### Web Interface
-1. Connect to WiFi AP: **"ESP32_Display"**
+1. Connect to WiFi AP: **"MAZDUINO_Display"** (Password: **"12345678"**)
 2. Navigate to: **http://192.168.4.1**
 3. Configure data sources and layout
 4. Save settings to EEPROM
